@@ -1,0 +1,1 @@
+This Bot balances using stepper motors, in contrast to my other Bot that uses small lightweight gimbal motors. The advantage here is no encoders needed. Uses the same handheld controller using ESP NOW.

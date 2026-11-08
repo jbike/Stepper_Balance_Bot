@@ -1,0 +1,214 @@
+// HW675 ESP32-C3 / 0.42-inch OLED ESP-NOW joystick remote
+// Arduino board: ESP32C3 Dev Module
+// Libraries: U8g2 (plus ESP32 Arduino core)
+//
+// Hall joystick X -> GPIO0, Y -> GPIO1, button -> GPIO3 and GND
+// IMPORTANT: Hall joystick VCC -> GPIO4, NOT the 3V3 rail.
+// OLED uses GPIO5 SDA and GPIO6 SCL (as in working HW675 sketch)
+// Add a 10k-47k pullup GPIO3 -> 3V3 for reliable deep-sleep wakeup.
+
+#include <Arduino.h>
+#include <Wire.h>
+#include <U8g2lib.h>
+#include <WiFi.h>
+#include <esp_now.h>
+#include <esp_sleep.h>
+
+constexpr int OLED_SDA = 5;
+constexpr int OLED_SCL = 6;
+constexpr int JOY_X = 0;
+constexpr int JOY_Y = 1;
+constexpr int JOY_BUTTON = 3;
+constexpr int JOY_POWER = 4; // GPIO4 feeds Hall joystick VCC
+
+// Change these if motion on your display or bot runs backward.
+constexpr bool INVERT_X = true;
+constexpr bool INVERT_Y = false;
+constexpr int DEADZONE = 35; // about 3% of half-travel, adjust if needed
+// Actual Hall joystick ADC measurements supplied by John.
+constexpr int X_MIN = 47;
+constexpr int X_CENTER = 1271;
+constexpr int X_MAX = 2478;
+constexpr int Y_MIN = 46;    // forward
+constexpr int Y_CENTER = 1209;
+constexpr int Y_MAX = 2476; // reverse
+constexpr uint32_t SEND_MS = 40;
+constexpr uint32_t HOLD_SLEEP_MS = 2000;
+constexpr uint32_t DEBOUNCE_MS = 35;
+constexpr uint16_t MAGIC = 0xB017;
+
+U8G2_SSD1306_128X64_NONAME_F_HW_I2C display(
+  U8G2_R0, OLED_SCL, OLED_SDA, U8X8_PIN_NONE);
+
+struct __attribute__((packed)) ControlPacket {
+  uint16_t signature;
+  uint16_t sequence;
+  int16_t throttle;  // -1000 to +1000
+  int16_t steering;  // -1000 to +1000
+  uint8_t armed;     // 0 = stop, 1 = control enabled
+};
+
+const uint8_t broadcastMAC[6] = {0xff,0xff,0xff,0xff,0xff,0xff};
+uint16_t sequenceNumber = 0;
+bool armed = false;
+bool buttonWasDown = false;
+bool ignoreButtonUntilRelease = false;
+uint32_t pressedAt = 0;
+uint32_t lastSend = 0;
+uint32_t lastDraw = 0;
+int16_t throttle = 0;
+int16_t steering = 0;
+
+int16_t axisValue(int pin, int rawMin, int center,
+                  int rawMax, bool invert) {
+  int raw = analogRead(pin);
+  int delta = raw - center;
+  if (abs(delta) <= DEADZONE) return 0;
+  int available = (delta > 0) ? rawMax - center : center - rawMin;
+  if (available <= DEADZONE) return 0;
+  // Piecewise linear about the measured center, ending at +/-1000.
+  int magnitude = map(abs(delta), DEADZONE, available, 0, 1000);
+  int result = constrain(magnitude, 0, 1000) * (delta < 0 ? -1 : 1);
+  return invert ? -result : result;
+}
+
+void transmit(int16_t speed, int16_t turn, bool enable) {
+  ControlPacket p = {MAGIC, sequenceNumber++,
+                     (int16_t)(enable ? speed : 0),
+                     (int16_t)(enable ? turn : 0),
+                     (uint8_t)(enable ? 1 : 0)};
+  esp_now_send(broadcastMAC, (const uint8_t*)&p, sizeof(p));
+}
+
+void drawDisplay() {
+  // Physical 72 x 40 visible portion of the offset 128 x 64 buffer.
+  constexpr int L = 28, R = 99, T = 24, B = 63;
+  constexpr int CX = (L + R) / 2;
+  constexpr int CY = (T + B) / 2;
+  // Show the command ACTUALLY sent: centered when disarmed.
+  int16_t showX = armed ? steering : 0;
+  int16_t showY = armed ? throttle : 0;
+  int dotX = map(showX, -1000, 1000, L+4, R-4);
+  int dotY = map(showY, -1000, 1000, B-4, T+4);
+
+  display.clearBuffer();
+  display.drawFrame(L, T, R-L+1, B-T+1);
+  for (int y = T+3; y <= B-3; y += 5)
+    display.drawVLine(CX, y, 2);
+  for (int x = L+3; x <= R-3; x += 5)
+    display.drawHLine(x, CY, 2);
+  if (armed) display.drawDisc(dotX, dotY, 3);
+  else display.drawCircle(dotX, dotY, 3);
+  display.sendBuffer();
+}
+
+void goToSleep() {
+  armed = false;
+  for (int i = 0; i < 8; ++i) {
+    transmit(0, 0, false);
+    delay(35);
+  }
+  // Wait until the button is no longer asserting the wakeup level.
+  while (digitalRead(JOY_BUTTON) == LOW) delay(10);
+  delay(60);
+  display.clearBuffer();
+  display.sendBuffer();
+  display.setPowerSave(1);
+  // Power down both Hall sensors. Do not use gpio_hold_en() here:
+  // this HW675 drew 1.0 mA with hold enabled, but 0.1 mA without it.
+  digitalWrite(JOY_POWER, LOW);
+  Serial.println("Remote sleeping");
+  Serial.flush();
+  WiFi.mode(WIFI_OFF);
+  esp_deep_sleep_enable_gpio_wakeup(1ULL << JOY_BUTTON,
+                                    ESP_GPIO_WAKEUP_GPIO_LOW);
+  esp_deep_sleep_start();
+}
+
+void readButton() {
+  bool down = digitalRead(JOY_BUTTON) == LOW;
+  uint32_t now = millis();
+  if (ignoreButtonUntilRelease) {
+    if (!down) ignoreButtonUntilRelease = false;
+    return;
+  }
+  if (down && !buttonWasDown) {
+    pressedAt = now;
+    buttonWasDown = true;
+  }
+  if (down && buttonWasDown && now - pressedAt >= HOLD_SLEEP_MS)
+    goToSleep();
+  if (!down && buttonWasDown) {
+    buttonWasDown = false;
+    if (now - pressedAt >= DEBOUNCE_MS) {
+      armed = !armed;
+      // Always send neutral immediately on arm/disarm transition.
+      transmit(0, 0, armed);
+      drawDisplay();
+      Serial.println(armed ? "ARM request" : "DISARM request");
+    }
+  }
+}
+
+void setup() {
+  Serial.begin(115200);
+  digitalWrite(JOY_POWER, LOW);
+  pinMode(JOY_POWER, OUTPUT);
+  digitalWrite(JOY_POWER, HIGH);
+  delay(20); // Allow Hall electronics and outputs to settle.
+  pinMode(JOY_BUTTON, INPUT_PULLUP);
+  ignoreButtonUntilRelease =
+    (esp_sleep_get_wakeup_cause() == ESP_SLEEP_WAKEUP_GPIO);
+
+  analogReadResolution(12);
+  analogSetPinAttenuation(JOY_X, ADC_11db);
+  analogSetPinAttenuation(JOY_Y, ADC_11db);
+
+  Wire.begin(OLED_SDA, OLED_SCL);
+  display.begin();
+  display.setPowerSave(0);
+  drawDisplay();
+
+  // Use measured calibration constants; startup position is irrelevant.
+  Serial.printf("Calibration X=%d/%d/%d Y=%d/%d/%d\n",
+                X_MIN, X_CENTER, X_MAX, Y_MIN, Y_CENTER, Y_MAX);
+
+  WiFi.mode(WIFI_STA);
+  WiFi.setChannel(1);
+  if (esp_now_init() != ESP_OK) {
+    Serial.println("ESP-NOW init FAILED");
+    return;
+  }
+  esp_now_peer_info_t peer = {};
+  memcpy(peer.peer_addr, broadcastMAC, 6);
+  peer.channel = 1;
+  peer.encrypt = false;
+  if (esp_now_add_peer(&peer) != ESP_OK)
+    Serial.println("ESP-NOW add peer FAILED");
+  transmit(0, 0, false);
+  Serial.println("HW675 ready, DISARMED");
+}
+
+void loop() {
+  readButton();
+  uint32_t now = millis();
+  if (now - lastSend >= SEND_MS) {
+    lastSend = now;
+    steering = axisValue(JOY_X, X_MIN, X_CENTER, X_MAX, INVERT_X);
+    throttle = axisValue(JOY_Y, Y_MIN, Y_CENTER, Y_MAX, INVERT_Y);
+    transmit(throttle, steering, armed);
+  }
+  if (now - lastDraw >= 50) {
+    lastDraw = now;
+    drawDisplay();
+  }
+  static uint32_t lastPrint = 0;
+  if (now - lastPrint >= 500) {
+    lastPrint = now;
+    Serial.printf("armed=%d Xraw=%d Yraw=%d X=%+d%% Y=%+d%%\n",
+                  armed, analogRead(JOY_X), analogRead(JOY_Y),
+                  (armed ? steering : 0) / 10,
+                  (armed ? throttle : 0) / 10);
+  }
+  delay(2);
+}
